@@ -1,4 +1,6 @@
+from io import StringIO
 from pathlib import Path
+from urllib.request import urlopen
 
 import pandas as pd
 import plotly.express as px
@@ -7,8 +9,8 @@ import streamlit as st
 
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_FILE = BASE_DIR / "datatran_unificado.csv"
-
+DATA_URL = "https://github.com/luizgustavogr/dashboard-datatran/releases/download/v1.0/datatran_unificado.csv"
+LOCAL_DATA_FILE = BASE_DIR / "datatran_unificado.csv"
 
 st.set_page_config(
     page_title="Dashboard DATATRAN",
@@ -16,10 +18,15 @@ st.set_page_config(
     layout="wide",
 )
 
-
 @st.cache_data(show_spinner=False)
-def load_data(file_path: Path) -> pd.DataFrame:
-    df = pd.read_csv(file_path, sep=";", encoding="utf-8", low_memory=False)
+def load_data(source: str | Path) -> pd.DataFrame:
+    if isinstance(source, Path):
+        df = pd.read_csv(source, sep=";", encoding="utf-8", low_memory=False)
+    else:
+        with urlopen(source) as response:
+            csv_text = response.read().decode("utf-8-sig")
+        df = pd.read_csv(StringIO(csv_text), sep=";", low_memory=False)
+
     df.columns = [column.strip().lower() for column in df.columns]
 
     if "data_inversa" not in df.columns:
@@ -124,11 +131,17 @@ def main() -> None:
     st.title("Dashboard DATATRAN")
     st.caption("Analise do CSV unificado com comparativos entre anos, estados, causas e gravidade dos acidentes.")
 
-    if not DATA_FILE.exists():
-        st.error(f"Arquivo nao encontrado: {DATA_FILE.name}")
-        st.stop()
+    try:
+        df = load_data(DATA_URL)
+        st.sidebar.success("Fonte carregada da release do GitHub.")
+    except Exception:
+        if LOCAL_DATA_FILE.exists():
+            df = load_data(LOCAL_DATA_FILE)
+            st.sidebar.warning("Nao foi possivel carregar a release; usando o CSV local.")
+        else:
+            st.error("Nao foi possivel carregar os dados da release nem encontrar o CSV local.")
+            st.stop()
 
-    df = load_data(DATA_FILE)
     df = df.dropna(subset=["ano"])
 
     filtered = apply_filters(df)
