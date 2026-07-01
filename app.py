@@ -11,6 +11,20 @@ import streamlit as st
 BASE_DIR = Path(__file__).resolve().parent
 DATA_URL = "https://github.com/luizgustavogr/dashboard-datatran/releases/download/v1.0/datatran_unificado.csv"
 LOCAL_DATA_FILE = BASE_DIR / "datatran_unificado.csv"
+USECOLS = [
+    "id",
+    "data_inversa",
+    "uf",
+    "causa_acidente",
+    "classificacao_acidente",
+    "tipo_pista",
+    "pessoas",
+    "mortos",
+    "feridos_leves",
+    "feridos_graves",
+    "feridos",
+    "veiculos",
+]
 
 st.set_page_config(
     page_title="Dashboard DATATRAN",
@@ -20,12 +34,18 @@ st.set_page_config(
 
 @st.cache_data(show_spinner=False)
 def load_data(source: str | Path) -> pd.DataFrame:
+    read_kwargs = {
+        "sep": ";",
+        "low_memory": False,
+        "usecols": lambda column: column in USECOLS,
+    }
+
     if isinstance(source, Path):
-        df = pd.read_csv(source, sep=";", encoding="utf-8", low_memory=False)
+        df = pd.read_csv(source, encoding="utf-8", **read_kwargs)
     else:
         with urlopen(source) as response:
             csv_text = response.read().decode("utf-8-sig")
-        df = pd.read_csv(StringIO(csv_text), sep=";", low_memory=False)
+        df = pd.read_csv(StringIO(csv_text), **read_kwargs)
 
     df.columns = [column.strip().lower() for column in df.columns]
 
@@ -34,12 +54,11 @@ def load_data(source: str | Path) -> pd.DataFrame:
 
     df["data_inversa"] = pd.to_datetime(df["data_inversa"], errors="coerce")
     df["ano"] = df["data_inversa"].dt.year
-    df["mes"] = df["data_inversa"].dt.month
 
-    text_columns = ["uf", "municipio", "causa_acidente", "tipo_acidente", "classificacao_acidente", "fase_dia", "tipo_pista"]
+    text_columns = ["uf", "causa_acidente", "tipo_acidente", "classificacao_acidente", "fase_dia", "tipo_pista"]
     for column in text_columns:
         if column in df.columns:
-            df[column] = df[column].astype(str).str.strip()
+            df[column] = df[column].astype("string").str.strip()
 
     numeric_columns = [
         "pessoas",
@@ -129,18 +148,13 @@ def add_metric_card(label: str, value: float, delta: str | None = None) -> None:
 
 def main() -> None:
     st.title("Dashboard DATATRAN")
-    st.caption("Analise do CSV unificado com comparativos entre anos, estados, causas e gravidade dos acidentes.")
+    st.caption("Análise de dados sobre acidentes em rodovias federais brasileiras.")
 
     try:
         df = load_data(DATA_URL)
-        st.sidebar.success("Fonte carregada da release do GitHub.")
     except Exception:
-        if LOCAL_DATA_FILE.exists():
-            df = load_data(LOCAL_DATA_FILE)
-            st.sidebar.warning("Nao foi possivel carregar a release; usando o CSV local.")
-        else:
-            st.error("Nao foi possivel carregar os dados da release nem encontrar o CSV local.")
-            st.stop()
+        st.error("Nao foi possivel carregar os dados.")
+        st.stop()
 
     df = df.dropna(subset=["ano"])
 
