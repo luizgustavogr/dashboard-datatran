@@ -33,7 +33,7 @@ USECOLS = [
     "feridos",
     "veiculos",
 ]
-
+#teste
 st.set_page_config(
     page_title="Dashboard DATATRAN",
     page_icon="📊",
