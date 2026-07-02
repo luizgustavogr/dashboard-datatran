@@ -11,12 +11,19 @@ import streamlit as st
 BASE_DIR = Path(__file__).resolve().parent
 DATA_URL = "https://github.com/luizgustavogr/dashboard-datatran/releases/download/v1.0/datatran_unificado.csv"
 LOCAL_DATA_FILE = BASE_DIR / "datatran_unificado.csv"
+PLACAS_DATA_FILE = BASE_DIR / "placas_sinalizacao_processado.csv"
+RADARES_DATA_FILE = BASE_DIR / "radares_velocidade_processado.csv"
+MOCK_END_YEAR = 2023
 USECOLS = [
     "id",
     "data_inversa",
+    "dia_semana",
+    "br",
+    "km",
     "uf",
     "causa_acidente",
     "classificacao_acidente",
+    "fase_dia",
     "tipo_pista",
     "pessoas",
     "mortos",
@@ -55,10 +62,22 @@ def load_data(source: str | Path) -> pd.DataFrame:
     df["data_inversa"] = pd.to_datetime(df["data_inversa"], errors="coerce")
     df["ano"] = df["data_inversa"].dt.year
 
-    text_columns = ["uf", "causa_acidente", "tipo_acidente", "classificacao_acidente", "fase_dia", "tipo_pista"]
+    text_columns = ["uf", "causa_acidente", "tipo_acidente", "classificacao_acidente", "fase_dia", "tipo_pista", "dia_semana"]
     for column in text_columns:
         if column in df.columns:
             df[column] = df[column].astype("string").str.strip()
+
+    if "dia_semana" not in df.columns:
+        dias_semana = {
+            0: "segunda-feira",
+            1: "terça-feira",
+            2: "quarta-feira",
+            3: "quinta-feira",
+            4: "sexta-feira",
+            5: "sábado",
+            6: "domingo",
+        }
+        df["dia_semana"] = df["data_inversa"].dt.dayofweek.map(dias_semana)
 
     numeric_columns = [
         "pessoas",
@@ -110,31 +129,143 @@ def build_year_summary(df: pd.DataFrame) -> pd.DataFrame:
     return summary
 
 
+@st.cache_data(show_spinner=False)
+def build_mock_year_summary(
+    source: str | Path,
+    series_name: str,
+    year_column: str | None = None,
+    date_column: str | None = None,
+) -> pd.DataFrame:
+    df = pd.read_csv(source, sep=";", low_memory=False, encoding="utf-8-sig")
+    df.columns = [column.strip().lower() for column in df.columns]
+
+    if year_column and year_column in df.columns:
+        df["ano"] = pd.to_numeric(df[year_column], errors="coerce")
+    elif date_column and date_column in df.columns:
+        df[date_column] = pd.to_datetime(df[date_column], errors="coerce")
+        df["ano"] = df[date_column].dt.year
+    else:
+        raise ValueError(f"Nao foi possivel identificar o ano no arquivo {source}.")
+
+    summary = (
+        df.dropna(subset=["ano"])
+        .assign(ano=lambda frame: frame["ano"].astype(int))
+        .groupby("ano", dropna=True)
+        .size()
+        .reset_index(name=series_name)
+    )
+
+    return summary[summary["ano"] <= MOCK_END_YEAR]
+
+
+def normalize_br_series(series: pd.Series) -> pd.Series:
+    extracted = series.astype("string").str.extract(r"(\d+)", expand=False)
+    return pd.to_numeric(extracted, errors="coerce").astype("Int64")
+
+
+def merge_intervals(intervals: pd.DataFrame) -> list[tuple[float, float]]:
+    merged: list[tuple[float, float]] = []
+    for start, end in intervals.sort_values("km_m_inicio")[["km_m_inicio", "km_m_final"]].to_numpy(dtype=float):
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+        else:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+    return merged
+
+
+@st.cache_data(show_spinner=False)
+def build_plate_match_summary(datatran_source: str | Path, placas_source: str | Path) -> pd.DataFrame:
+    accident_df = pd.read_csv(
+        datatran_source,
+        sep=";",
+        low_memory=False,
+        encoding="utf-8-sig",
+        usecols=lambda column: column in {"id", "data_inversa", "br", "km"},
+    )
+    accident_df.columns = [column.strip().lower() for column in accident_df.columns]
+    accident_df["data_inversa"] = pd.to_datetime(accident_df["data_inversa"], errors="coerce")
+    accident_df["ano"] = accident_df["data_inversa"].dt.year
+    accident_df["br"] = normalize_br_series(accident_df.get("br", pd.Series(dtype="string")))
+    accident_df["km"] = pd.to_numeric(accident_df.get("km", pd.Series(dtype="float")), errors="coerce")
+    accident_df = accident_df.dropna(subset=["ano", "br", "km"])
+    accident_df["ano"] = accident_df["ano"].astype(int)
+
+    placas_df = pd.read_csv(placas_source, sep=";", low_memory=False, encoding="utf-8-sig")
+    placas_df.columns = [column.strip().lower() for column in placas_df.columns]
+    placas_df["br"] = pd.to_numeric(placas_df.get("br"), errors="coerce").astype("Int64")
+    placas_df["km_m_inicio"] = pd.to_numeric(placas_df.get("km_m_inicio"), errors="coerce")
+    placas_df["km_m_final"] = pd.to_numeric(placas_df.get("km_m_final"), errors="coerce")
+    placas_df = placas_df.dropna(subset=["br", "km_m_inicio", "km_m_final"])
+
+    plates_by_br = {
+        int(br): merge_intervals(group)
+        for br, group in placas_df.groupby("br", dropna=True)
+    }
+
+    accident_df["placa_encontrada"] = False
+    for br_value, accident_group in accident_df.groupby("br", sort=False):
+        intervals = plates_by_br.get(int(br_value))
+        if not intervals:
+            continue
+
+        starts = pd.Series([start for start, _ in intervals], dtype="float64").to_numpy()
+        ends = pd.Series([end for _, end in intervals], dtype="float64").to_numpy()
+        km_values = accident_group["km"].to_numpy(dtype=float)
+
+        interval_index = starts.searchsorted(km_values, side="right") - 1
+        valid = interval_index >= 0
+        valid_km = km_values[valid]
+        valid_index = interval_index[valid]
+        matched = valid_km <= ends[valid_index]
+
+        accident_df.loc[accident_group.index, "placa_encontrada"] = False
+        accident_df.loc[accident_group.index[valid], "placa_encontrada"] = matched
+
+    summary = (
+        accident_df[accident_df["ano"] <= MOCK_END_YEAR]
+        .groupby(["ano", "placa_encontrada"], dropna=True)
+        .size()
+        .unstack(fill_value=0)
+        .reset_index()
+    )
+
+    summary = summary.rename(columns={True: "Com placa", False: "Sem placa"})
+    if "Com placa" not in summary.columns:
+        summary["Com placa"] = 0
+    if "Sem placa" not in summary.columns:
+        summary["Sem placa"] = 0
+
+    summary = summary.rename(columns={"ano": "Ano"}).sort_values("Ano")
+    return summary
+
+
 def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
-    st.sidebar.header("Filtros")
+    st.subheader("Filtros")
+
+    filter_row_1 = st.columns(3)
 
     years = sorted([int(year) for year in df["ano"].dropna().unique()])
-    year_min, year_max = st.sidebar.slider("Faixa de anos", min_value=min(years), max_value=max(years), value=(min(years), max(years)))
+    with filter_row_1[0]:
+        selected_years = st.multiselect("Faixa de anos", years, default=years)
 
-    filtered = df[df["ano"].between(year_min, year_max)]
+    if selected_years:
+        filtered = df[df["ano"].isin(selected_years)]
+    else:
+        filtered = df.iloc[0:0]
 
     if "uf" in filtered.columns:
         ufs = sorted(filtered["uf"].dropna().astype(str).unique().tolist())
-        selected_ufs = st.sidebar.multiselect("UF", ufs, default=ufs)
+        with filter_row_1[1]:
+            selected_ufs = st.multiselect("UF", ufs, default=ufs)
         if selected_ufs:
             filtered = filtered[filtered["uf"].isin(selected_ufs)]
 
     if "classificacao_acidente" in filtered.columns:
         classificacoes = sorted(filtered["classificacao_acidente"].dropna().astype(str).unique().tolist())
-        selected_classificacoes = st.sidebar.multiselect("Classificacao", classificacoes, default=classificacoes)
+        with filter_row_1[2]:
+            selected_classificacoes = st.multiselect("Classificacao", classificacoes, default=classificacoes)
         if selected_classificacoes:
             filtered = filtered[filtered["classificacao_acidente"].isin(selected_classificacoes)]
-
-    if "tipo_pista" in filtered.columns:
-        tipos_pista = sorted(filtered["tipo_pista"].dropna().astype(str).unique().tolist())
-        selected_tipos_pista = st.sidebar.multiselect("Tipo de pista", tipos_pista, default=tipos_pista)
-        if selected_tipos_pista:
-            filtered = filtered[filtered["tipo_pista"].isin(selected_tipos_pista)]
 
     return filtered
 
@@ -165,17 +296,9 @@ def main() -> None:
         st.stop()
 
     year_summary = build_year_summary(filtered)
-    latest_year = int(year_summary["ano"].max())
-    latest_row = year_summary.loc[year_summary["ano"] == latest_year].iloc[0]
-
-    previous_year = None
-    previous_row = None
-    if len(year_summary) > 1:
-        previous_year = int(year_summary.iloc[-2]["ano"])
-        previous_row = year_summary.iloc[-2]
 
     st.subheader("Indicadores gerais")
-    metric_cols = st.columns(5)
+    metric_cols = st.columns(4)
 
     with metric_cols[0]:
         add_metric_card("Acidentes", filtered.shape[0])
@@ -185,18 +308,12 @@ def main() -> None:
         add_metric_card("Feridos totais", year_summary["feridos_totais"].sum())
     with metric_cols[3]:
         add_metric_card("Veiculos", filtered["veiculos"].fillna(0).sum())
-    with metric_cols[4]:
-        delta_text = None
-        if previous_row is not None and latest_row["acidentes"] is not None and previous_row["acidentes"]:
-            delta_value = ((latest_row["acidentes"] - previous_row["acidentes"]) / previous_row["acidentes"]) * 100
-            delta_text = f"{delta_value:.1f}% vs {previous_year}"
-        add_metric_card(f"Acidentes em {latest_year}", latest_row["acidentes"], delta_text)
 
     st.divider()
 
-    left_col, right_col = st.columns((2, 1))
+    year_left_col, year_center_col, year_right_col = st.columns((1, 2, 1))
 
-    with left_col:
+    with year_center_col:
         st.subheader("Comparativo entre anos")
         fig_years = go.Figure()
         fig_years.add_trace(
@@ -226,7 +343,9 @@ def main() -> None:
         )
         st.plotly_chart(fig_years, use_container_width=True)
 
-    with right_col:
+    graph_col_1, graph_col_2 = st.columns(2)
+
+    with graph_col_1:
         st.subheader("Peso por gravidade")
         severity = pd.DataFrame(
             {
@@ -244,10 +363,26 @@ def main() -> None:
         fig_severity.update_layout(height=450, margin=dict(l=10, r=10, t=30, b=10))
         st.plotly_chart(fig_severity, use_container_width=True)
 
+    with graph_col_2:
+        st.subheader("Tipos de pista")
+        tipo_pista_summary = (
+            filtered.groupby("tipo_pista", dropna=True)
+            .agg(acidentes=("id", "count"))
+            .reset_index()
+            .sort_values("acidentes", ascending=False)
+        )
+
+        fig_tipo_pista = px.pie(tipo_pista_summary, values="acidentes", names="tipo_pista", hole=0.45)
+        fig_tipo_pista.update_layout(
+            height=450,
+            margin=dict(l=10, r=10, t=30, b=10),
+        )
+        st.plotly_chart(fig_tipo_pista, use_container_width=True)
+
     col1, col2 = st.columns(2)
 
     with col1:
-        st.subheader("Top 10 estados")
+        st.subheader("Comparativo entre os principais estados")
         uf_summary = (
             filtered.groupby("uf", dropna=True)
             .agg(acidentes=("id", "count"), mortos=("mortos", "sum"))
@@ -260,7 +395,7 @@ def main() -> None:
         st.plotly_chart(fig_uf, use_container_width=True)
 
     with col2:
-        st.subheader("Top 10 causas")
+        st.subheader("Principais causas de acidente")
         cause_summary = (
             filtered.groupby("causa_acidente", dropna=True)
             .agg(acidentes=("id", "count"), mortos=("mortos", "sum"))
@@ -279,6 +414,57 @@ def main() -> None:
         fig_cause.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10), xaxis_title="Acidentes", yaxis_title="Causa")
         st.plotly_chart(fig_cause, use_container_width=True)
 
+    st.subheader("Comparativo entre fase do dia e dia da semana")
+    fase_dia_base = filtered.dropna(subset=["fase_dia", "dia_semana"]).copy()
+    fase_dia_base["fase_dia"] = fase_dia_base["fase_dia"].astype("string").str.strip()
+    fase_dia_base["dia_semana"] = fase_dia_base["dia_semana"].astype("string").str.strip()
+
+    fase_dia_order = ["Amanhecer", "Pleno dia", "Anoitecer", "Plena Noite"]
+    dia_semana_order = [
+        "domingo",
+        "segunda-feira",
+        "terça-feira",
+        "quarta-feira",
+        "quinta-feira",
+        "sexta-feira",
+        "sábado",
+    ]
+
+    fase_dia_summary = (
+        fase_dia_base.pivot_table(
+            index="fase_dia",
+            columns="dia_semana",
+            values="id",
+            aggfunc="count",
+            fill_value=0,
+        )
+        .reindex(index=fase_dia_order, columns=dia_semana_order)
+        .fillna(0)
+    )
+
+    if fase_dia_summary.empty or fase_dia_summary.to_numpy().sum() == 0:
+        st.info("Nao ha dados suficientes de fase do dia para montar o comparativo.")
+    else:
+        fig_fase_dia = go.Figure(
+            data=go.Heatmap(
+                x=list(fase_dia_summary.columns),
+                y=list(fase_dia_summary.index),
+                z=fase_dia_summary.to_numpy(),
+                colorscale="YlOrRd",
+                text=fase_dia_summary.to_numpy(),
+                texttemplate="%{text}",
+                hovertemplate="Fase do dia=%{y}<br>Dia da semana=%{x}<br>Acidentes=%{z}<extra></extra>",
+                colorbar=dict(title="Acidentes"),
+            )
+        )
+        fig_fase_dia.update_layout(
+            height=420,
+            margin=dict(l=10, r=10, t=30, b=10),
+            xaxis_title="Dia da semana",
+            yaxis_title="Fase do dia",
+        )
+        st.plotly_chart(fig_fase_dia, use_container_width=True)
+
     st.subheader("Tabela comparativa por ano")
     table = year_summary.copy()
     table["mortes_por_1000_acidentes"] = table["mortes_por_1000_acidentes"].round(2)
@@ -293,6 +479,41 @@ def main() -> None:
         file_name="datatran_filtrado.csv",
         mime="text/csv",
     )
+
+    st.subheader("Acidentes ocorridos em locais sinalizados")
+    st.caption("Gráfico independente dos filtros, com dados até 2023.")
+
+    mock_summary = build_plate_match_summary(DATA_URL, PLACAS_DATA_FILE)
+
+    if mock_summary.empty:
+        st.info("Nao foi possivel montar o panorama mockado com os arquivos disponiveis.")
+    else:
+        fig_mock = go.Figure()
+        fig_mock.add_trace(
+            go.Bar(
+                x=mock_summary["Ano"],
+                y=mock_summary["Com placa"],
+                name="Com placa",
+                marker_color="#2E86DE",
+            )
+        )
+        fig_mock.add_trace(
+            go.Bar(
+                x=mock_summary["Ano"],
+                y=mock_summary["Sem placa"],
+                name="Sem placa",
+                marker_color="#C0392B",
+            )
+        )
+        fig_mock.update_layout(
+            barmode="group",
+            height=430,
+            margin=dict(l=10, r=10, t=30, b=10),
+            xaxis_title="Ano",
+            yaxis_title="Quantidade de acidentes",
+            legend_title_text="Resultado",
+        )
+        st.plotly_chart(fig_mock, use_container_width=True)
 
 
 if __name__ == "__main__":
