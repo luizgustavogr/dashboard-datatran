@@ -428,21 +428,19 @@ def main() -> None:
     if weather_summary.empty:
         st.info("Nao ha dados suficientes para montar o comparativo por condicao meteorologica.")
     else:
-        fig_weather = px.bar(
-            weather_summary.sort_values("acidentes"),
-            x="acidentes",
-            y="condicao_metereologica",
-            orientation="h",
-            color="acidentes",
-            color_continuous_scale="Blues",
-        )
-        fig_weather.update_layout(
-            height=420,
-            margin=dict(l=10, r=10, t=30, b=10),
-            xaxis_title="Acidentes",
-            yaxis_title="Condicao meteorologica",
-        )
-        st.plotly_chart(fig_weather, width="stretch")
+        weather_left_col, weather_center_col, weather_right_col = st.columns((1, 2, 1))
+
+        with weather_center_col:
+            fig_weather = px.bar(
+                weather_summary.sort_values("acidentes"),
+                x="acidentes",
+                y="condicao_metereologica",
+                orientation="h",
+                color="acidentes",
+                color_continuous_scale="Blues",
+            )
+            fig_weather.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10))
+            st.plotly_chart(fig_weather, width="stretch")
 
     st.subheader("Comparativo entre fase do dia e dia da semana")
     fase_dia_base = filtered.dropna(subset=["fase_dia", "dia_semana"]).copy()
