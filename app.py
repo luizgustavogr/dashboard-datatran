@@ -456,8 +456,11 @@ def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
     clicked = map_state.get("last_object_clicked") if isinstance(map_state, dict) else None
     if clicked:
         clicked_uf = resolve_clicked_uf(clicked, geojson_data)
-        if clicked_uf and clicked_uf not in st.session_state[selected_ufs_key]:
-            st.session_state[selected_ufs_key].append(clicked_uf)
+        if clicked_uf:
+            if clicked_uf in st.session_state[selected_ufs_key]:
+                st.session_state[selected_ufs_key].remove(clicked_uf)
+            else:
+                st.session_state[selected_ufs_key].append(clicked_uf)
             st.rerun()
 
     selected_ufs = st.session_state[selected_ufs_key]
