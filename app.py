@@ -1,11 +1,16 @@
 from io import StringIO
 from pathlib import Path
+from copy import deepcopy
 from urllib.request import urlopen
 
+import folium
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import requests
+from branca.colormap import linear
+from streamlit_folium import st_folium
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -14,6 +19,7 @@ LOCAL_DATA_FILE = BASE_DIR / "datatran_unificado.csv"
 PLACAS_DATA_FILE = BASE_DIR / "placas_sinalizacao_processado.csv"
 RADARES_DATA_FILE = BASE_DIR / "radares_velocidade_processado.csv"
 MOCK_END_YEAR = 2023
+BRAZIL_STATES_GEOJSON_URL = "https://raw.githubusercontent.com/codeforamerica/click_that_hood/master/public/data/brazil-states.geojson"
 USECOLS = [
     "id",
     "data_inversa",
@@ -21,6 +27,7 @@ USECOLS = [
     "br",
     "km",
     "uf",
+    "municipio",
     "causa_acidente",
     "classificacao_acidente",
     "condicao_metereologica",
@@ -33,6 +40,7 @@ USECOLS = [
     "feridos",
     "veiculos",
 ]
+
 #teste
 st.set_page_config(
     page_title="Dashboard DATATRAN",
@@ -63,7 +71,7 @@ def load_data(source: str | Path) -> pd.DataFrame:
     df["data_inversa"] = pd.to_datetime(df["data_inversa"], errors="coerce")
     df["ano"] = df["data_inversa"].dt.year
 
-    text_columns = ["uf", "causa_acidente", "tipo_acidente", "classificacao_acidente", "condicao_metereologica", "fase_dia", "tipo_pista", "dia_semana"]
+    text_columns = ["uf", "municipio", "causa_acidente", "tipo_acidente", "classificacao_acidente", "condicao_metereologica", "fase_dia", "tipo_pista", "dia_semana"]
     for column in text_columns:
         if column in df.columns:
             df[column] = df[column].astype("string").str.strip()
@@ -107,6 +115,173 @@ def format_number(value: float) -> str:
     return f"{int(value):,}".replace(",", ".")
 
 
+@st.cache_data(show_spinner=False)
+def load_brazil_states_geojson() -> dict:
+    response = requests.get(BRAZIL_STATES_GEOJSON_URL, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+def _point_in_ring(lng: float, lat: float, ring: list[list[float]]) -> bool:
+    inside = False
+    if len(ring) < 3:
+        return False
+
+    previous_x, previous_y = ring[-1]
+    for current_x, current_y in ring:
+        intersects = ((current_y > lat) != (previous_y > lat)) and (
+            lng < (previous_x - current_x) * (lat - current_y) / ((previous_y - current_y) or 1e-12) + current_x
+        )
+        if intersects:
+            inside = not inside
+        previous_x, previous_y = current_x, current_y
+    return inside
+
+
+def _point_in_geometry(lng: float, lat: float, geometry: dict) -> bool:
+    geometry_type = geometry.get("type")
+    coordinates = geometry.get("coordinates", [])
+
+    def polygon_contains(polygon_coordinates: list[list[list[float]]]) -> bool:
+        if not polygon_coordinates:
+            return False
+        if not _point_in_ring(lng, lat, polygon_coordinates[0]):
+            return False
+        return not any(_point_in_ring(lng, lat, hole) for hole in polygon_coordinates[1:])
+
+    if geometry_type == "Polygon":
+        return polygon_contains(coordinates)
+
+    if geometry_type == "MultiPolygon":
+        return any(polygon_contains(polygon) for polygon in coordinates)
+
+    return False
+
+
+def _geometry_centroid(geometry: dict) -> tuple[float, float] | None:
+    points: list[tuple[float, float]] = []
+
+    def collect(coords: list) -> None:
+        for item in coords:
+            if isinstance(item[0], (int, float)):
+                points.append((float(item[0]), float(item[1])))
+            else:
+                collect(item)
+
+    collect(geometry.get("coordinates", []))
+    if not points:
+        return None
+
+    longitudes = [point[0] for point in points]
+    latitudes = [point[1] for point in points]
+    return (sum(longitudes) / len(longitudes), sum(latitudes) / len(latitudes))
+
+
+def build_brazil_map(uf_summary: pd.DataFrame, selected_ufs: list[str]) -> folium.Map:
+    geojson_data = load_brazil_states_geojson()
+    enriched_geojson = deepcopy(geojson_data)
+    summary_by_uf = {
+        str(row["uf"]): row for _, row in uf_summary.iterrows()
+    }
+
+    if uf_summary.empty:
+        min_accidents = 0
+        max_accidents = 1
+    else:
+        min_accidents = int(uf_summary["acidentes"].min())
+        max_accidents = int(uf_summary["acidentes"].max())
+        if min_accidents == max_accidents:
+            max_accidents = min_accidents + 1
+
+    colormap = linear.Blues_09.scale(min_accidents, max_accidents)
+    # colormap.caption = "Número de acidentees"
+
+    for feature in enriched_geojson.get("features", []):
+        properties = feature.setdefault("properties", {})
+        sigla = str(properties.get("sigla", "")).strip()
+        summary_row = summary_by_uf.get(sigla)
+        acidentes = int(summary_row["acidentes"]) if summary_row is not None else 0
+        mortos = float(summary_row["mortos"]) if summary_row is not None else 0.0
+        letalidade = (mortos / acidentes * 100) if acidentes else 0.0
+
+        properties["uf"] = sigla
+        properties["nome_estado"] = properties.get("name", sigla)
+        properties["acidentes"] = acidentes
+        properties["letalidade"] = f"{letalidade:.2f}%"
+        properties["selecionado"] = sigla in selected_ufs
+
+    brazil_map = folium.Map(location=[-14.235, -51.9253], zoom_start=4, tiles="cartodbpositron", control_scale=True)
+
+    def style_function(feature: dict) -> dict:
+        properties = feature.get("properties", {})
+        acidentes = int(properties.get("acidentes", 0))
+        selecionado = bool(properties.get("selecionado", False))
+        base_fill = "#EFF6FF" if acidentes == 0 else colormap(acidentes)
+
+        if selecionado:
+            return {
+                "fillColor": "#F97316",
+                "color": "#C2410C",
+                "weight": 3,
+                "fillOpacity": 0.82,
+            }
+
+        return {
+            "fillColor": base_fill,
+            "color": "#1D4ED8",
+            "weight": 1.3,
+            "fillOpacity": 0.72,
+        }
+
+    tooltip = folium.GeoJsonTooltip(
+        fields=["nome_estado", "uf", "acidentes", "letalidade"],
+        aliases=["Nome do estado:", "Sigla do estado:", "Número de acidentes:", "Taxa de letalidade:"],
+        localize=True,
+        sticky=False,
+        labels=True,
+        style=(
+            "background-color: white; color: #111827; font-family: Arial; font-size: 13px; padding: 8px;"
+        ),
+        max_width=260,
+    )
+
+    geojson_layer = folium.GeoJson(
+        enriched_geojson,
+        name="Estados",
+        style_function=style_function,
+        highlight_function=lambda feature: {
+            "weight": 3.5,
+            "color": "#EA580C",
+            "fillOpacity": 0.9,
+        },
+        tooltip=tooltip,
+    )
+    geojson_layer.add_to(brazil_map)
+
+    try:
+        brazil_map.fit_bounds(geojson_layer.get_bounds())
+    except Exception:
+        pass
+
+    return brazil_map
+
+
+def resolve_clicked_uf(click_data: dict, geojson_data: dict) -> str | None:
+    lat = click_data.get("lat")
+    lng = click_data.get("lng")
+    if lat is None or lng is None:
+        return None
+
+    for feature in geojson_data.get("features", []):
+        properties = feature.get("properties", {})
+        sigla = str(properties.get("sigla", "")).strip()
+        geometry = feature.get("geometry", {})
+        if sigla and _point_in_geometry(float(lng), float(lat), geometry):
+            return sigla
+
+    return None
+
+
 def build_year_summary(df: pd.DataFrame) -> pd.DataFrame:
     summary = (
         df.groupby("ano", dropna=True)
@@ -123,40 +298,14 @@ def build_year_summary(df: pd.DataFrame) -> pd.DataFrame:
         .sort_values("ano")
     )
 
-    summary["mortes_por_1000_acidentes"] = summary["mortos"] / summary["acidentes"].replace(0, pd.NA) * 1000
-    summary["feridos_totais"] = summary[["feridos_leves", "feridos_graves", "feridos"]].fillna(0).sum(axis=1)
-    summary["variacao_acidentes_pct"] = summary["acidentes"].pct_change() * 100
-    summary["variacao_mortos_pct"] = summary["mortos"].pct_change() * 100
+    summary["feridos_totais"] = summary["feridos"].fillna(0)
+    summary["mortes_por_1000_acidentes"] = (
+        summary["mortos"].fillna(0) / summary["acidentes"].replace(0, pd.NA) * 1000
+    ).fillna(0)
+    summary["variacao_acidentes_pct"] = summary["acidentes"].pct_change().mul(100).fillna(0)
+    summary["variacao_mortos_pct"] = summary["mortos"].pct_change().mul(100).fillna(0)
+
     return summary
-
-
-@st.cache_data(show_spinner=False)
-def build_mock_year_summary(
-    source: str | Path,
-    series_name: str,
-    year_column: str | None = None,
-    date_column: str | None = None,
-) -> pd.DataFrame:
-    df = pd.read_csv(source, sep=";", low_memory=False, encoding="utf-8-sig")
-    df.columns = [column.strip().lower() for column in df.columns]
-
-    if year_column and year_column in df.columns:
-        df["ano"] = pd.to_numeric(df[year_column], errors="coerce")
-    elif date_column and date_column in df.columns:
-        df[date_column] = pd.to_datetime(df[date_column], errors="coerce")
-        df["ano"] = df[date_column].dt.year
-    else:
-        raise ValueError(f"Nao foi possivel identificar o ano no arquivo {source}.")
-
-    summary = (
-        df.dropna(subset=["ano"])
-        .assign(ano=lambda frame: frame["ano"].astype(int))
-        .groupby("ano", dropna=True)
-        .size()
-        .reset_index(name=series_name)
-    )
-
-    return summary[summary["ano"] <= MOCK_END_YEAR]
 
 
 def normalize_br_series(series: pd.Series) -> pd.Series:
@@ -243,7 +392,7 @@ def build_plate_match_summary(datatran_source: str | Path, placas_source: str | 
 def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
     st.subheader("Filtros")
 
-    filter_row_1 = st.columns(3)
+    filter_row_1 = st.columns(2)
 
     years = sorted([int(year) for year in df["ano"].dropna().unique()])
     with filter_row_1[0]:
@@ -254,19 +403,66 @@ def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
     else:
         filtered = df.iloc[0:0]
 
-    if "uf" in filtered.columns:
-        ufs = sorted(filtered["uf"].dropna().astype(str).unique().tolist())
-        with filter_row_1[1]:
-            selected_ufs = st.multiselect("UF", ufs, default=ufs)
-        if selected_ufs:
-            filtered = filtered[filtered["uf"].isin(selected_ufs)]
-
     if "classificacao_acidente" in filtered.columns:
         classificacoes = sorted(filtered["classificacao_acidente"].dropna().astype(str).unique().tolist())
-        with filter_row_1[2]:
+        with filter_row_1[1]:
             selected_classificacoes = st.multiselect("Classificacao", classificacoes, default=classificacoes)
         if selected_classificacoes:
             filtered = filtered[filtered["classificacao_acidente"].isin(selected_classificacoes)]
+
+    if filtered.empty or "uf" not in filtered.columns:
+        return filtered
+
+    uf_summary = (
+        filtered.dropna(subset=["uf"])
+        .assign(uf=lambda frame: frame["uf"].astype("string").str.strip())
+        .groupby("uf", dropna=True)
+        .agg(acidentes=("id", "count"), mortos=("mortos", "sum"))
+        .reset_index()
+        .sort_values("acidentes", ascending=False)
+    )
+
+    if uf_summary.empty:
+        return filtered
+
+    available_ufs = uf_summary["uf"].tolist()
+    selected_ufs_key = "selected_ufs_map"
+    geojson_data = load_brazil_states_geojson()
+
+    if selected_ufs_key not in st.session_state:
+        st.session_state[selected_ufs_key] = []
+    else:
+        st.session_state[selected_ufs_key] = [uf for uf in st.session_state[selected_ufs_key] if uf in available_ufs]
+
+    st.subheader("Filtro por região")
+    st.caption("Clique nos estados no mapa para adicionar à seleção. Quando não há estados selecionados, nenhum filtro regional é aplicado.")
+
+    map_col, info_col = st.columns([2.2, 1])
+    with map_col:
+        brazil_map = build_brazil_map(uf_summary, st.session_state[selected_ufs_key])
+        map_state = st_folium(
+            brazil_map,
+            key="brazil_map",
+            height=520,
+            use_container_width=True,
+            returned_objects=["last_object_clicked"],
+        )
+
+    with info_col:
+        st.metric("Estados selecionados", len(st.session_state[selected_ufs_key]))
+        selected_text = ", ".join(st.session_state[selected_ufs_key]) if st.session_state[selected_ufs_key] else "Nenhum"
+        st.write(selected_text)
+
+    clicked = map_state.get("last_object_clicked") if isinstance(map_state, dict) else None
+    if clicked:
+        clicked_uf = resolve_clicked_uf(clicked, geojson_data)
+        if clicked_uf and clicked_uf not in st.session_state[selected_ufs_key]:
+            st.session_state[selected_ufs_key].append(clicked_uf)
+            st.rerun()
+
+    selected_ufs = st.session_state[selected_ufs_key]
+    if selected_ufs:
+        filtered = filtered[filtered["uf"].isin(selected_ufs)]
 
     return filtered
 
@@ -391,29 +587,61 @@ def main() -> None:
             .sort_values(["acidentes", "mortos"], ascending=False)
             .head(10)
         )
-        fig_uf = px.bar(uf_summary, x="uf", y="acidentes", color="mortos", color_continuous_scale="Reds")
+        fig_uf = px.bar(
+            uf_summary,
+            x="uf",
+            y="acidentes",
+            color="mortos",
+            color_continuous_scale=["#0F172A", "#1D4ED8", "#60A5FA"],
+        )
         fig_uf.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10), xaxis_title="UF", yaxis_title="Acidentes")
         st.plotly_chart(fig_uf, width="stretch")
 
     with col2:
-        st.subheader("Principais causas de acidente")
-        cause_summary = (
-            filtered.groupby("causa_acidente", dropna=True)
+        st.subheader("Comparativo entre os principais municípios")
+        municipio_summary = (
+            filtered.dropna(subset=["municipio"])
+            .assign(municipio=lambda frame: frame["municipio"].astype("string").str.strip())
+            .groupby("municipio", dropna=True)
             .agg(acidentes=("id", "count"), mortos=("mortos", "sum"))
             .reset_index()
             .sort_values(["acidentes", "mortos"], ascending=False)
             .head(10)
         )
-        fig_cause = px.bar(
-            cause_summary.sort_values("acidentes"),
-            x="acidentes",
-            y="causa_acidente",
-            orientation="h",
+        fig_municipio = px.bar(
+            municipio_summary,
+            x="municipio",
+            y="acidentes",
             color="mortos",
-            color_continuous_scale="OrRd",
+            color_continuous_scale=["#0F172A", "#1D4ED8", "#60A5FA"],
         )
-        fig_cause.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10), xaxis_title="Acidentes", yaxis_title="Causa")
-        st.plotly_chart(fig_cause, width="stretch")
+        fig_municipio.update_layout(
+            height=420,
+            margin=dict(l=10, r=10, t=30, b=10),
+            xaxis_title="Município",
+            yaxis_title="Acidentes",
+        )
+        fig_municipio.update_xaxes(tickangle=-35)
+        st.plotly_chart(fig_municipio, width="stretch")
+
+    st.subheader("Principais causas de acidente")
+    cause_summary = (
+        filtered.groupby("causa_acidente", dropna=True)
+        .agg(acidentes=("id", "count"), mortos=("mortos", "sum"))
+        .reset_index()
+        .sort_values(["acidentes", "mortos"], ascending=False)
+        .head(10)
+    )
+    fig_cause = px.bar(
+        cause_summary.sort_values("acidentes"),
+        x="acidentes",
+        y="causa_acidente",
+        orientation="h",
+        color="mortos",
+        color_continuous_scale="OrRd",
+    )
+    fig_cause.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10), xaxis_title="Acidentes", yaxis_title="Causa")
+    st.plotly_chart(fig_cause, width="stretch")
 
     st.subheader("Acidentes por condição meteorológica")
     weather_summary = (
@@ -437,7 +665,7 @@ def main() -> None:
                 y="condicao_metereologica",
                 orientation="h",
                 color="acidentes",
-                color_continuous_scale="Blues",
+                color_continuous_scale=["#0F2A15", "#1DD86B", "#60FA9B"],
             )
             fig_weather.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10))
             st.plotly_chart(fig_weather, width="stretch")

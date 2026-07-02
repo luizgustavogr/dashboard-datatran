@@ -10,7 +10,8 @@ function findInputFiles(directory) {
 		.readdirSync(directory)
 		.filter((fileName) => /^datatran\d{4}_processado\.csv$/i.test(fileName))
 		.sort((left, right) => left.localeCompare(right, 'pt-BR'));
-}
+		// teste
+	}
 
 function splitCsvLine(line) {
 	const values = [];
