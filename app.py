@@ -23,6 +23,7 @@ USECOLS = [
     "uf",
     "causa_acidente",
     "classificacao_acidente",
+    "condicao_metereologica",
     "fase_dia",
     "tipo_pista",
     "pessoas",
@@ -62,7 +63,7 @@ def load_data(source: str | Path) -> pd.DataFrame:
     df["data_inversa"] = pd.to_datetime(df["data_inversa"], errors="coerce")
     df["ano"] = df["data_inversa"].dt.year
 
-    text_columns = ["uf", "causa_acidente", "tipo_acidente", "classificacao_acidente", "fase_dia", "tipo_pista", "dia_semana"]
+    text_columns = ["uf", "causa_acidente", "tipo_acidente", "classificacao_acidente", "condicao_metereologica", "fase_dia", "tipo_pista", "dia_semana"]
     for column in text_columns:
         if column in df.columns:
             df[column] = df[column].astype("string").str.strip()
@@ -341,7 +342,7 @@ def main() -> None:
             legend_title_text="Serie",
             margin=dict(l=10, r=10, t=30, b=10),
         )
-        st.plotly_chart(fig_years, use_container_width=True)
+        st.plotly_chart(fig_years, width="stretch")
 
     graph_col_1, graph_col_2 = st.columns(2)
 
@@ -361,7 +362,7 @@ def main() -> None:
 
         fig_severity = px.pie(severity, values="Valor", names="Categoria", hole=0.45)
         fig_severity.update_layout(height=450, margin=dict(l=10, r=10, t=30, b=10))
-        st.plotly_chart(fig_severity, use_container_width=True)
+        st.plotly_chart(fig_severity, width="stretch")
 
     with graph_col_2:
         st.subheader("Tipos de pista")
@@ -377,7 +378,7 @@ def main() -> None:
             height=450,
             margin=dict(l=10, r=10, t=30, b=10),
         )
-        st.plotly_chart(fig_tipo_pista, use_container_width=True)
+        st.plotly_chart(fig_tipo_pista, width="stretch")
 
     col1, col2 = st.columns(2)
 
@@ -392,7 +393,7 @@ def main() -> None:
         )
         fig_uf = px.bar(uf_summary, x="uf", y="acidentes", color="mortos", color_continuous_scale="Reds")
         fig_uf.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10), xaxis_title="UF", yaxis_title="Acidentes")
-        st.plotly_chart(fig_uf, use_container_width=True)
+        st.plotly_chart(fig_uf, width="stretch")
 
     with col2:
         st.subheader("Principais causas de acidente")
@@ -412,7 +413,36 @@ def main() -> None:
             color_continuous_scale="OrRd",
         )
         fig_cause.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10), xaxis_title="Acidentes", yaxis_title="Causa")
-        st.plotly_chart(fig_cause, use_container_width=True)
+        st.plotly_chart(fig_cause, width="stretch")
+
+    st.subheader("Acidentes por condição meteorológica")
+    weather_summary = (
+        filtered.dropna(subset=["condicao_metereologica"])
+        .assign(condicao_metereologica=lambda frame: frame["condicao_metereologica"].astype("string").str.strip())
+        .groupby("condicao_metereologica", dropna=True)
+        .agg(acidentes=("id", "count"))
+        .reset_index()
+        .sort_values("acidentes", ascending=False)
+    )
+
+    if weather_summary.empty:
+        st.info("Nao ha dados suficientes para montar o comparativo por condicao meteorologica.")
+    else:
+        fig_weather = px.bar(
+            weather_summary.sort_values("acidentes"),
+            x="acidentes",
+            y="condicao_metereologica",
+            orientation="h",
+            color="acidentes",
+            color_continuous_scale="Blues",
+        )
+        fig_weather.update_layout(
+            height=420,
+            margin=dict(l=10, r=10, t=30, b=10),
+            xaxis_title="Acidentes",
+            yaxis_title="Condicao meteorologica",
+        )
+        st.plotly_chart(fig_weather, width="stretch")
 
     st.subheader("Comparativo entre fase do dia e dia da semana")
     fase_dia_base = filtered.dropna(subset=["fase_dia", "dia_semana"]).copy()
@@ -463,14 +493,14 @@ def main() -> None:
             xaxis_title="Dia da semana",
             yaxis_title="Fase do dia",
         )
-        st.plotly_chart(fig_fase_dia, use_container_width=True)
+        st.plotly_chart(fig_fase_dia, width="stretch")
 
     st.subheader("Tabela comparativa por ano")
     table = year_summary.copy()
     table["mortes_por_1000_acidentes"] = table["mortes_por_1000_acidentes"].round(2)
     table["variacao_acidentes_pct"] = table["variacao_acidentes_pct"].round(2)
     table["variacao_mortos_pct"] = table["variacao_mortos_pct"].round(2)
-    st.dataframe(table, use_container_width=True, hide_index=True)
+    st.dataframe(table, width="stretch", hide_index=True)
 
     csv_export = filtered.to_csv(index=False, sep=";")
     st.download_button(
@@ -513,7 +543,7 @@ def main() -> None:
             yaxis_title="Quantidade de acidentes",
             legend_title_text="Resultado",
         )
-        st.plotly_chart(fig_mock, use_container_width=True)
+        st.plotly_chart(fig_mock, width="stretch")
 
 
 if __name__ == "__main__":
