@@ -41,6 +41,20 @@ USECOLS = [
     "veiculos",
 ]
 
+# Cores padrão para o contexto de acidentes (Cores quentes para casos mais graves)
+COLOR_ACIDENTES = "#1D4ED8"     # Azul escuro/royal para acidentes (neutro)
+COLOR_MORTOS = "#991B1B"        # Vermelho escuro/carmesim para casos fatais (grave)
+COLOR_FERIDOS_LEVES = "#FBBF24" # Amarelo/âmbar para ferimentos leves
+COLOR_FERIDOS = "#F97316"       # Laranja para ferimentos gerais
+COLOR_FERIDOS_GRAVES = "#EF4444" # Vermelho claro/laranja-avermelhado para ferimentos graves
+
+COLOR_MAP_SEVERIDADE = {
+    "Feridos leves": COLOR_FERIDOS_LEVES,
+    "Feridos": COLOR_FERIDOS,
+    "Feridos graves": COLOR_FERIDOS_GRAVES,
+    "Mortos": COLOR_MORTOS
+}
+
 #teste
 st.set_page_config(
     page_title="Dashboard DATATRAN",
@@ -193,7 +207,7 @@ def build_brazil_map(uf_summary: pd.DataFrame, selected_ufs: list[str]) -> foliu
         if min_accidents == max_accidents:
             max_accidents = min_accidents + 1
 
-    colormap = linear.Blues_09.scale(min_accidents, max_accidents)
+    colormap = linear.YlOrRd_09.scale(min_accidents, max_accidents)
     # colormap.caption = "Número de acidentees"
 
     for feature in enriched_geojson.get("features", []):
@@ -216,19 +230,19 @@ def build_brazil_map(uf_summary: pd.DataFrame, selected_ufs: list[str]) -> foliu
         properties = feature.get("properties", {})
         acidentes = int(properties.get("acidentes", 0))
         selecionado = bool(properties.get("selecionado", False))
-        base_fill = "#EFF6FF" if acidentes == 0 else colormap(acidentes)
+        base_fill = "#FFFDF5" if acidentes == 0 else colormap(acidentes)
 
         if selecionado:
             return {
-                "fillColor": "#F97316",
-                "color": "#C2410C",
-                "weight": 3,
-                "fillOpacity": 0.82,
+                "fillColor": "#7F1D1D",
+                "color": "#000000",
+                "weight": 3.5,
+                "fillOpacity": 0.85,
             }
 
         return {
             "fillColor": base_fill,
-            "color": "#1D4ED8",
+            "color": "#D97706",
             "weight": 1.3,
             "fillOpacity": 0.72,
         }
@@ -251,7 +265,7 @@ def build_brazil_map(uf_summary: pd.DataFrame, selected_ufs: list[str]) -> foliu
         style_function=style_function,
         highlight_function=lambda feature: {
             "weight": 3.5,
-            "color": "#EA580C",
+            "color": "#B91C1C",
             "fillOpacity": 0.9,
         },
         tooltip=tooltip,
@@ -389,160 +403,461 @@ def build_plate_match_summary(datatran_source: str | Path, placas_source: str | 
     return summary
 
 
-def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
-    st.subheader("Filtros")
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_radar_data() -> pd.DataFrame:
+    try:
+        url = "https://servicos.dnit.gov.br/services-sior/portal-multas/pncv/equipamentos"
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        geojson_data = response.json()
+        features = geojson_data.get("features", [])
+        records = []
+        for feature in features:
+            prop = feature.get("properties", {})
+            geom = feature.get("geometry", {})
+            coords = geom.get("coordinates", [None, None])
+            records.append({
+                "uf": str(prop.get("uf", "")).strip().upper(),
+                "municipio": str(prop.get("municipio", "")).strip().upper(),
+                "br": str(prop.get("rodovia", "")).strip(),
+                "km": str(prop.get("km", "")).strip(),
+                "latitude": coords[1],
+                "longitude": coords[0],
+                "tipo": str(prop.get("tipoNome", "")).strip(),
+            })
+        return pd.DataFrame(records)
+    except Exception:
+        # Fallback to local file if available
+        if Path(RADARES_DATA_FILE).exists():
+            try:
+                df = pd.read_csv(RADARES_DATA_FILE, sep=";")
+                df.columns = [col.strip().lower() for col in df.columns]
+                if "uf" in df.columns:
+                    df["uf"] = df["uf"].astype(str).str.strip().str.upper()
+                return df
+            except Exception:
+                pass
+        return pd.DataFrame()
 
-    filter_row_1 = st.columns(2)
+
+def apply_sidebar_filters(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, list[int]]:
+    st.sidebar.header("Filtros")
 
     years = sorted([int(year) for year in df["ano"].dropna().unique()])
-    with filter_row_1[0]:
-        selected_years = st.multiselect("Faixa de anos", years, default=years)
+    selected_years = st.sidebar.multiselect("Faixa de anos", years, default=years)
 
-    if selected_years:
-        filtered = df[df["ano"].isin(selected_years)]
-    else:
-        filtered = df.iloc[0:0]
-
-    if "classificacao_acidente" in filtered.columns:
-        classificacoes = sorted(filtered["classificacao_acidente"].dropna().astype(str).unique().tolist())
-        with filter_row_1[1]:
-            selected_classificacoes = st.multiselect("Classificacao", classificacoes, default=classificacoes)
+    # Filtra por classificação primeiro nos dados originais para termos o dataframe base sem filtro de anos
+    classification_filtered = df
+    if "classificacao_acidente" in df.columns:
+        classificacoes = sorted(df["classificacao_acidente"].dropna().astype(str).unique().tolist())
+        selected_classificacoes = st.sidebar.multiselect("Classificação", classificacoes, default=classificacoes)
         if selected_classificacoes:
-            filtered = filtered[filtered["classificacao_acidente"].isin(selected_classificacoes)]
+            classification_filtered = df[df["classificacao_acidente"].isin(selected_classificacoes)]
 
-    if filtered.empty or "uf" not in filtered.columns:
-        return filtered
-
-    uf_summary = (
-        filtered.dropna(subset=["uf"])
-        .assign(uf=lambda frame: frame["uf"].astype("string").str.strip())
-        .groupby("uf", dropna=True)
-        .agg(acidentes=("id", "count"), mortos=("mortos", "sum"))
-        .reset_index()
-        .sort_values("acidentes", ascending=False)
-    )
-
-    if uf_summary.empty:
-        return filtered
-
-    available_ufs = uf_summary["uf"].tolist()
-    selected_ufs_key = "selected_ufs_map"
-    geojson_data = load_brazil_states_geojson()
-
-    if selected_ufs_key not in st.session_state:
-        st.session_state[selected_ufs_key] = []
+    # Aplica filtro de anos para o dataframe principal
+    if selected_years:
+        filtered = classification_filtered[classification_filtered["ano"].isin(selected_years)]
     else:
-        st.session_state[selected_ufs_key] = [uf for uf in st.session_state[selected_ufs_key] if uf in available_ufs]
+        filtered = classification_filtered.iloc[0:0]
 
-    st.subheader("Filtro por região")
-    st.caption("Clique nos estados no mapa para adicionar à seleção. Quando não há estados selecionados, nenhum filtro regional é aplicado.")
-
-    map_col, info_col = st.columns([2.2, 1])
-    with map_col:
-        brazil_map = build_brazil_map(uf_summary, st.session_state[selected_ufs_key])
-        map_state = st_folium(
-            brazil_map,
-            key="brazil_map",
-            height=520,
-            use_container_width=True,
-            returned_objects=["last_object_clicked"],
-        )
-
-    with info_col:
-        st.metric("Estados selecionados", len(st.session_state[selected_ufs_key]))
-        selected_text = ", ".join(st.session_state[selected_ufs_key]) if st.session_state[selected_ufs_key] else "Nenhum"
-        st.write(selected_text)
-
-    clicked = map_state.get("last_object_clicked") if isinstance(map_state, dict) else None
-    if clicked:
-        clicked_uf = resolve_clicked_uf(clicked, geojson_data)
-        if clicked_uf:
-            if clicked_uf in st.session_state[selected_ufs_key]:
-                st.session_state[selected_ufs_key].remove(clicked_uf)
-            else:
-                st.session_state[selected_ufs_key].append(clicked_uf)
-            st.rerun()
-
-    selected_ufs = st.session_state[selected_ufs_key]
-    if selected_ufs:
-        filtered = filtered[filtered["uf"].isin(selected_ufs)]
-
-    return filtered
+    return filtered, classification_filtered, selected_years
 
 
-def add_metric_card(label: str, value: float, delta: str | None = None) -> None:
-    if delta is None:
-        st.metric(label, format_number(value))
-    else:
-        st.metric(label, format_number(value), delta)
+def add_metric_card(label: str, value: float | str, delta: str | None = None, delta_color: str = "normal") -> None:
+    formatted_value = value if isinstance(value, str) else format_number(value)
+    st.metric(label, formatted_value, delta, delta_color=delta_color, border=True)
+
+
+def calculate_kpis(df: pd.DataFrame) -> dict[str, float]:
+    if df.empty:
+        return {
+            "taxa_gravidade": 0.0,
+            "taxa_chuva": 0.0,
+            "taxa_mortalidade": 0.0
+        }
+    
+    # 1. Taxa de gravidade em pistas simples (acidentes graves em pistas simples / total de acidentes em pistas simples)
+    pistas_simples = df[df["tipo_pista"].fillna("").astype(str).str.strip().str.capitalize() == "Simples"]
+    total_simples = pistas_simples.shape[0]
+    graves_simples = pistas_simples[
+        (pistas_simples["feridos_graves"].fillna(0) > 0) | (pistas_simples["mortos"].fillna(0) > 0)
+    ].shape[0]
+    taxa_gravidade = (graves_simples / total_simples * 100) if total_simples else 0.0
+
+    # 2. Proporção de acidentes em condições de chuva (acidentes sob chuva / total de acidentes)
+    total_acidentes = df.shape[0]
+    acidentes_chuva = df[df["condicao_metereologica"].fillna("").astype(str).str.strip().str.lower().str.contains("chuva", na=False)].shape[0]
+    taxa_chuva = (acidentes_chuva / total_acidentes * 100) if total_acidentes else 0.0
+
+    # 3. Taxa de mortalidade (óbitos / total de acidentes)
+    mortos_totais = df["mortos"].fillna(0).sum()
+    taxa_mortalidade = (mortos_totais / total_acidentes * 100) if total_acidentes else 0.0
+
+    return {
+        "taxa_gravidade": taxa_gravidade,
+        "taxa_chuva": taxa_chuva,
+        "taxa_mortalidade": taxa_mortalidade
+    }
 
 
 def main() -> None:
+    # Custom CSS for elevated (popped-up) metric cards
+    st.markdown("""
+        <style>
+        div[data-testid="metric-container"] {
+            background-color: #f1f5f9;
+            border: 2px solid #cbd5e1;
+            padding: 15px 20px;
+            border-radius: 12px;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+        div[data-testid="metric-container"]:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.15), 0 10px 10px -5px rgba(0, 0, 0, 0.06);
+            border-color: #94a3b8;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
     st.title("Dashboard DATATRAN")
     st.caption("Análise de dados sobre acidentes em rodovias federais brasileiras.")
 
     try:
         df = load_data(DATA_URL)
     except Exception:
-        st.error("Nao foi possivel carregar os dados.")
+        st.error("Não foi possível carregar os dados.")
         st.stop()
 
     df = df.dropna(subset=["ano"])
 
-    filtered = apply_filters(df)
+    # 1. Apply Sidebar Filters
+    sidebar_filtered, classification_filtered, selected_years = apply_sidebar_filters(df)
+
+    # 2. Regional Map filter state (single selection)
+    selected_ufs_key = "selected_ufs_map"
+    if selected_ufs_key not in st.session_state:
+        st.session_state[selected_ufs_key] = []
+
+    # Clean up selection if not in available UFs of the current sidebar selection
+    available_ufs = sidebar_filtered["uf"].dropna().unique().tolist()
+    st.session_state[selected_ufs_key] = [uf for uf in st.session_state[selected_ufs_key] if uf in available_ufs]
+
+    # Calculate final filtered DataFrame (including regional state selection)
+    selected_ufs = st.session_state[selected_ufs_key]
+    if selected_ufs:
+        filtered = sidebar_filtered[sidebar_filtered["uf"].isin(selected_ufs)]
+    else:
+        filtered = sidebar_filtered
 
     if filtered.empty:
         st.warning("Nenhum registro corresponde aos filtros selecionados.")
         st.stop()
 
-    year_summary = build_year_summary(filtered)
+    # Load Speed Radar Data from DNIT API
+    radar_df = load_radar_data()
+    if not radar_df.empty:
+        if selected_ufs:
+            selected_uf = selected_ufs[0]
+            radar_count = radar_df[radar_df["uf"] == selected_uf.upper()].shape[0]
+        else:
+            radar_count = radar_df.shape[0]
+    else:
+        radar_count = 0
 
-    st.subheader("Indicadores gerais")
-    metric_cols = st.columns(4)
+    # 3. KPIs de Segurança Viária com deltas baseados nas regras do usuário
+    if selected_years:
+        sorted_years = sorted([int(y) for y in selected_years])
+        year_curr = sorted_years[-1]
+        
+        # Regras de comparação para o delta:
+        if len(sorted_years) >= 2:
+            # Se filtrar por dois ou mais anos (ou todos os anos), compara o mais recente com o mais próximo
+            year_prev = sorted_years[-2]
+        else:
+            # Se tiver somente um, compara com o anterior (calendário)
+            year_prev = year_curr - 1
+            # Se for o primeiro ano do dataset geral, não há o que mostrar
+            min_possible_year = int(df["ano"].dropna().min())
+            if year_prev < min_possible_year:
+                year_prev = None
+    else:
+        year_curr = None
+        year_prev = None
+
+    # Slices de dados para o cálculo (aplicando o mesmo filtro de UF selecionada se houver)
+    if selected_ufs:
+        df_curr_base = classification_filtered[classification_filtered["uf"].isin(selected_ufs)]
+    else:
+        df_curr_base = classification_filtered
+
+    # Os KPIs mostram o valor do ano mais recente (year_curr) e o delta compara com o anterior (year_prev)
+    if year_curr is not None:
+        df_curr = df_curr_base[df_curr_base["ano"] == year_curr]
+    else:
+        df_curr = df_curr_base.iloc[0:0]
+
+    if year_prev is not None:
+        df_prev = df_curr_base[df_curr_base["ano"] == year_prev]
+    else:
+        df_prev = df_curr_base.iloc[0:0]
+
+    kpis_curr = calculate_kpis(df_curr)
+    kpis_prev = calculate_kpis(df_prev)
+
+    # Formatação de delta de forma relativa
+    def format_kpi_delta(val_curr: float, val_prev: float) -> str | None:
+        if year_prev is None or not val_prev:
+            return None
+        pct_change = ((val_curr - val_prev) / val_prev * 100)
+        return f"{pct_change:+.2f}%"
+
+    delta_gravidade = format_kpi_delta(kpis_curr["taxa_gravidade"], kpis_prev["taxa_gravidade"])
+    delta_chuva = format_kpi_delta(kpis_curr["taxa_chuva"], kpis_prev["taxa_chuva"])
+    delta_mortalidade = format_kpi_delta(kpis_curr["taxa_mortalidade"], kpis_prev["taxa_mortalidade"])
+
+    st.subheader("Principais Métricas")
+    if year_curr is not None:
+        if year_prev is not None:
+            caption_text = f"Métricas calculadas para o ano de {year_curr}. Os deltas comparam a variação percentual relativa contra o ano de {year_prev} (redução = verde)."
+        else:
+            caption_text = f"Métricas calculadas para o ano inicial de {year_curr} (sem comparação anterior)."
+    else:
+        caption_text = "Selecione pelo menos um ano para calcular as métricas."
+    st.caption(caption_text)
+
+    kpi_cols = st.columns(3)
+
+    with kpi_cols[0]:
+        add_metric_card(
+            label="Taxa de Gravidade (Pista Simples)",
+            value=f"{kpis_curr['taxa_gravidade']:.2f}%",
+            delta=delta_gravidade,
+            delta_color="inverse"
+        )
+    with kpi_cols[1]:
+        add_metric_card(
+            label="Taxa de Acidentes sob Chuva",
+            value=f"{kpis_curr['taxa_chuva']:.2f}%",
+            delta=delta_chuva,
+            delta_color="inverse"
+        )
+    with kpi_cols[2]:
+        add_metric_card(
+            label="Taxa de Mortalidade",
+            value=f"{kpis_curr['taxa_mortalidade']:.2f}%",
+            delta=delta_mortalidade,
+            delta_color="inverse"
+        )
+
+    # 3.1 Metric cards
+    st.subheader("Panorama Geral")
+    metric_cols = st.columns(5)
 
     with metric_cols[0]:
         add_metric_card("Acidentes", filtered.shape[0])
     with metric_cols[1]:
         add_metric_card("Mortos", filtered["mortos"].fillna(0).sum())
     with metric_cols[2]:
-        add_metric_card("Feridos totais", year_summary["feridos_totais"].sum())
+        add_metric_card("Feridos totais", filtered["feridos"].fillna(0).sum())
     with metric_cols[3]:
-        add_metric_card("Veiculos", filtered["veiculos"].fillna(0).sum())
+        add_metric_card("Veículos", filtered["veiculos"].fillna(0).sum())
+    with metric_cols[4]:
+        add_metric_card("Radares de Velocidade (DNIT)", radar_count)
 
     st.divider()
 
-    year_left_col, year_center_col, year_right_col = st.columns((1, 2, 1))
+    # 4. Regional Panorama (3-column layout)
+    st.subheader("Panorama Regional")
+    
+    col_left, col_mid, col_right = st.columns((1.1, 1.8, 1.1))
+    
+    # Left Column: Top 5 States
+    with col_left:
+        top_states = (
+            sidebar_filtered.groupby("uf", dropna=True)
+            .agg(acidentes=("id", "count"))
+            .reset_index()
+            .sort_values("acidentes", ascending=False)
+            .head(5)
+        )
+        fig_top_states = px.bar(
+            top_states,
+            x="uf",
+            y="acidentes",
+            color="acidentes",
+            color_continuous_scale=["#FDBA74", "#EF4444", "#991B1B"], # Cores quentes baseadas em intensidade
+        )
+        fig_top_states.update_layout(
+            title="Top 5 Estados",
+            height=380,
+            margin=dict(l=10, r=10, t=40, b=10),
+            coloraxis_showscale=False,
+            xaxis_title="UF",
+            yaxis_title="Acidentes",
+        )
+        st.plotly_chart(fig_top_states, use_container_width=True)
 
-    with year_center_col:
-        st.subheader("Comparativo entre anos")
-        fig_years = go.Figure()
-        fig_years.add_trace(
-            go.Bar(
+    # Middle Column: Map
+    with col_mid:
+        st.markdown("<p style='text-align: center; font-size: 0.85rem; color: gray; margin-bottom: 5px;'>Clique em um estado para filtrar. Clique novamente para limpar.</p>", unsafe_allow_html=True)
+        
+        uf_summary_map = (
+            sidebar_filtered.dropna(subset=["uf"])
+            .assign(uf=lambda frame: frame["uf"].astype("string").str.strip())
+            .groupby("uf", dropna=True)
+            .agg(acidentes=("id", "count"), mortos=("mortos", "sum"))
+            .reset_index()
+            .sort_values("acidentes", ascending=False)
+        )
+        
+        brazil_map = build_brazil_map(uf_summary_map, st.session_state[selected_ufs_key])
+        map_state = st_folium(
+            brazil_map,
+            key="brazil_map",
+            height=350,
+            use_container_width=True,
+            returned_objects=["last_object_clicked"],
+        )
+
+    # Right Column: Top 5 Municipalities
+    with col_right:
+        selected_uf = st.session_state[selected_ufs_key][0] if st.session_state[selected_ufs_key] else None
+        
+        if selected_uf:
+            muni_data = sidebar_filtered[sidebar_filtered["uf"] == selected_uf]
+            title_muni = f"Top 5 Municípios ({selected_uf})"
+        else:
+            muni_data = sidebar_filtered
+            title_muni = "Top 5 Municípios (Brasil)"
+            
+        top_munis = (
+            muni_data.dropna(subset=["municipio"])
+            .assign(municipio=lambda frame: frame["municipio"].astype("string").str.strip())
+            .groupby("municipio", dropna=True)
+            .agg(acidentes=("id", "count"))
+            .reset_index()
+            .sort_values("acidentes", ascending=False)
+            .head(5)
+        )
+        
+        fig_top_munis = px.bar(
+            top_munis,
+            x="municipio",
+            y="acidentes",
+            color="acidentes",
+            color_continuous_scale=["#FDBA74", "#EF4444", "#991B1B"], # Cores quentes baseadas em intensidade
+        )
+        fig_top_munis.update_layout(
+            title=title_muni,
+            height=380,
+            margin=dict(l=10, r=10, t=40, b=10),
+            coloraxis_showscale=False,
+            xaxis_title="Município",
+            yaxis_title="Acidentes",
+        )
+        fig_top_munis.update_xaxes(tickangle=-30)
+        st.plotly_chart(fig_top_munis, use_container_width=True)
+
+    # Handle map clicks (single selection)
+    geojson_data = load_brazil_states_geojson()
+    clicked = map_state.get("last_object_clicked") if isinstance(map_state, dict) else None
+    if clicked:
+        clicked_uf = resolve_clicked_uf(clicked, geojson_data)
+        if clicked_uf:
+            if clicked_uf in st.session_state[selected_ufs_key]:
+                st.session_state[selected_ufs_key] = []
+            else:
+                st.session_state[selected_ufs_key] = [clicked_uf]
+            st.rerun()
+
+    st.divider()
+
+    # 5. Comparativo entre Anos (Não é afetado pelo filtro de faixa de anos da sidebar)
+    if selected_ufs:
+        year_filtered_df = classification_filtered[classification_filtered["uf"].isin(selected_ufs)]
+    else:
+        year_filtered_df = classification_filtered
+
+    year_summary = build_year_summary(year_filtered_df)
+    
+    # Antiga implementação de gráfico único comentado
+    # st.subheader("Comparativo entre anos")
+    # fig_years = go.Figure()
+    # fig_years.add_trace(
+    #     go.Scatter(
+    #         x=year_summary["ano"],
+    #         y=year_summary["acidentes"],
+    #         name="Acidentes",
+    #         mode="lines+markers",
+    #         line=dict(color="#2E86DE", width=3),
+    #     )
+    # )
+    # fig_years.add_trace(
+    #     go.Scatter(
+    #         x=year_summary["ano"],
+    #         y=year_summary["mortos"],
+    #         name="Mortos",
+    #         mode="lines+markers",
+    #         line=dict(color="#C0392B", width=3),
+    #     )
+    # )
+    # fig_years.update_layout(
+    #     height=450,
+    #     xaxis_title="Ano",
+    #     yaxis_title="Quantidade",
+    #     legend_title_text="Série",
+    #     margin=dict(l=10, r=10, t=30, b=10),
+    # )
+    # st.plotly_chart(fig_years, use_container_width=True)
+
+    # Nova implementação com dois gráficos separados lado a lado
+    st.subheader("Comparativo entre anos")
+    col_years_1, col_years_2 = st.columns(2)
+    
+    with col_years_1:
+        st.markdown("<h5 style='text-align: center;'>Total de Acidentes</h5>", unsafe_allow_html=True)
+        fig_accidents = go.Figure()
+        fig_accidents.add_trace(
+            go.Scatter(
                 x=year_summary["ano"],
                 y=year_summary["acidentes"],
                 name="Acidentes",
-                marker_color="#2E86DE",
+                mode="lines+markers",
+                line=dict(color=COLOR_ACIDENTES, width=3),
             )
         )
-        fig_years.add_trace(
+        fig_accidents.update_layout(
+            height=380,
+            xaxis_title="Ano",
+            yaxis_title="Quantidade",
+            margin=dict(l=10, r=10, t=30, b=10),
+        )
+        st.plotly_chart(fig_accidents, use_container_width=True)
+        
+    with col_years_2:
+        st.markdown("<h5 style='text-align: center;'>Total de Mortos</h5>", unsafe_allow_html=True)
+        fig_deaths = go.Figure()
+        fig_deaths.add_trace(
             go.Scatter(
                 x=year_summary["ano"],
                 y=year_summary["mortos"],
                 name="Mortos",
                 mode="lines+markers",
-                line=dict(color="#C0392B", width=3),
+                line=dict(color=COLOR_MORTOS, width=3),
             )
         )
-        fig_years.update_layout(
-            barmode="group",
-            height=450,
+        fig_deaths.update_layout(
+            height=380,
             xaxis_title="Ano",
             yaxis_title="Quantidade",
-            legend_title_text="Serie",
             margin=dict(l=10, r=10, t=30, b=10),
         )
-        st.plotly_chart(fig_years, width="stretch")
+        st.plotly_chart(fig_deaths, use_container_width=True)
 
+    st.divider()
+
+    # 6. Outros Gráficos (Pie Charts)
     graph_col_1, graph_col_2 = st.columns(2)
 
     with graph_col_1:
@@ -559,9 +874,16 @@ def main() -> None:
             }
         )
 
-        fig_severity = px.pie(severity, values="Valor", names="Categoria", hole=0.45)
+        fig_severity = px.pie(
+            severity, 
+            values="Valor", 
+            names="Categoria", 
+            hole=0.45,
+            color="Categoria",
+            color_discrete_map=COLOR_MAP_SEVERIDADE
+        )
         fig_severity.update_layout(height=450, margin=dict(l=10, r=10, t=30, b=10))
-        st.plotly_chart(fig_severity, width="stretch")
+        st.plotly_chart(fig_severity, use_container_width=True)
 
     with graph_col_2:
         st.subheader("Tipos de pista")
@@ -572,61 +894,77 @@ def main() -> None:
             .sort_values("acidentes", ascending=False)
         )
 
-        fig_tipo_pista = px.pie(tipo_pista_summary, values="acidentes", names="tipo_pista", hole=0.45)
+        COLOR_MAP_PISTA = {
+            "Simples": "#93C5FD",  # Azul claro
+            "Dupla": "#2563EB",    # Azul royal
+            "Múltipla": "#1E3A8A"  # Azul marinho
+        }
+
+        fig_tipo_pista = px.pie(
+            tipo_pista_summary, 
+            values="acidentes", 
+            names="tipo_pista", 
+            hole=0.45,
+            color="tipo_pista",
+            color_discrete_map=COLOR_MAP_PISTA
+        )
         fig_tipo_pista.update_layout(
             height=450,
             margin=dict(l=10, r=10, t=30, b=10),
         )
-        st.plotly_chart(fig_tipo_pista, width="stretch")
+        st.plotly_chart(fig_tipo_pista, use_container_width=True)
 
-    col1, col2 = st.columns(2)
+    st.divider()
 
-    with col1:
-        st.subheader("Comparativo entre os principais estados")
-        uf_summary = (
-            filtered.groupby("uf", dropna=True)
-            .agg(acidentes=("id", "count"), mortos=("mortos", "sum"))
-            .reset_index()
-            .sort_values(["acidentes", "mortos"], ascending=False)
-            .head(10)
-        )
-        fig_uf = px.bar(
-            uf_summary,
-            x="uf",
-            y="acidentes",
-            color="mortos",
-            color_continuous_scale=["#0F172A", "#1D4ED8", "#60A5FA"],
-        )
-        fig_uf.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10), xaxis_title="UF", yaxis_title="Acidentes")
-        st.plotly_chart(fig_uf, width="stretch")
+    # 7. Causas e Condições Meteorológicas (Antiga implementação de 2 colunas comentada)
+    # cause_col, weather_col = st.columns(2)
+    # 
+    # with cause_col:
+    #     st.subheader("Principais causas de acidente")
+    #     cause_summary = (
+    #         filtered.groupby("causa_acidente", dropna=True)
+    #         .agg(acidentes=("id", "count"), mortos=("mortos", "sum"))
+    #         .reset_index()
+    #         .sort_values(["acidentes", "mortos"], ascending=False)
+    #         .head(10)
+    #     )
+    #     fig_cause = px.bar(
+    #         cause_summary.sort_values("acidentes"),
+    #         x="acidentes",
+    #         y="causa_acidente",
+    #         orientation="h",
+    #         color="mortos",
+    #         color_continuous_scale=["#FEE2E2", "#991B1B"],
+    #     )
+    #     fig_cause.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10), xaxis_title="Acidentes", yaxis_title="Causa")
+    #     st.plotly_chart(fig_cause, use_container_width=True)
+    # 
+    # with weather_col:
+    #     st.subheader("Acidentes por condição meteorológica")
+    #     weather_summary = (
+    #         filtered.dropna(subset=["condicao_metereologica"])
+    #         .assign(condicao_metereologica=lambda frame: frame["condicao_metereologica"].astype("string").str.strip())
+    #         .groupby("condicao_metereologica", dropna=True)
+    #         .agg(acidentes=("id", "count"), mortos=("mortos", "sum"))
+    #         .reset_index()
+    #         .sort_values("acidentes", ascending=False)
+    #     )
+    # 
+    #     if weather_summary.empty:
+    #         st.info("Não há dados suficientes para montar o comparativo por condição meteorológica.")
+    #     else:
+    #         fig_weather = px.bar(
+    #             weather_summary.sort_values("acidentes"),
+    #             x="acidentes",
+    #             y="condicao_metereologica",
+    #             orientation="h",
+    #             color="mortos",
+    #             color_continuous_scale=["#FEE2E2", "#991B1B"],
+    #         )
+    #         fig_weather.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10), coloraxis_colorbar=dict(title="Mortos"))
+    #         st.plotly_chart(fig_weather, use_container_width=True)
 
-    with col2:
-        st.subheader("Comparativo entre os principais municípios")
-        municipio_summary = (
-            filtered.dropna(subset=["municipio"])
-            .assign(municipio=lambda frame: frame["municipio"].astype("string").str.strip())
-            .groupby("municipio", dropna=True)
-            .agg(acidentes=("id", "count"), mortos=("mortos", "sum"))
-            .reset_index()
-            .sort_values(["acidentes", "mortos"], ascending=False)
-            .head(10)
-        )
-        fig_municipio = px.bar(
-            municipio_summary,
-            x="municipio",
-            y="acidentes",
-            color="mortos",
-            color_continuous_scale=["#0F172A", "#1D4ED8", "#60A5FA"],
-        )
-        fig_municipio.update_layout(
-            height=420,
-            margin=dict(l=10, r=10, t=30, b=10),
-            xaxis_title="Município",
-            yaxis_title="Acidentes",
-        )
-        fig_municipio.update_xaxes(tickangle=-35)
-        st.plotly_chart(fig_municipio, width="stretch")
-
+    # Nova implementação em linhas separadas de largura total
     st.subheader("Principais causas de acidente")
     cause_summary = (
         filtered.groupby("causa_acidente", dropna=True)
@@ -641,38 +979,40 @@ def main() -> None:
         y="causa_acidente",
         orientation="h",
         color="mortos",
-        color_continuous_scale="OrRd",
+        color_continuous_scale=["#FEE2E2", "#991B1B"], # Tons quentes de vermelho
     )
-    fig_cause.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10), xaxis_title="Acidentes", yaxis_title="Causa")
-    st.plotly_chart(fig_cause, width="stretch")
+    fig_cause.update_layout(height=450, margin=dict(l=10, r=10, t=30, b=10), xaxis_title="Acidentes", yaxis_title="Causa")
+    st.plotly_chart(fig_cause, use_container_width=True)
+
+    st.divider()
 
     st.subheader("Acidentes por condição meteorológica")
     weather_summary = (
         filtered.dropna(subset=["condicao_metereologica"])
         .assign(condicao_metereologica=lambda frame: frame["condicao_metereologica"].astype("string").str.strip())
         .groupby("condicao_metereologica", dropna=True)
-        .agg(acidentes=("id", "count"))
+        .agg(acidentes=("id", "count"), mortos=("mortos", "sum"))
         .reset_index()
         .sort_values("acidentes", ascending=False)
     )
 
     if weather_summary.empty:
-        st.info("Nao ha dados suficientes para montar o comparativo por condicao meteorologica.")
+        st.info("Não há dados suficientes para montar o comparativo por condição meteorológica.")
     else:
-        weather_left_col, weather_center_col, weather_right_col = st.columns((1, 2, 1))
+        fig_weather = px.bar(
+            weather_summary.sort_values("acidentes"),
+            x="acidentes",
+            y="condicao_metereologica",
+            orientation="h",
+            color="mortos",
+            color_continuous_scale=["#FEE2E2", "#991B1B"], # Cores quentes baseadas em mortes (casos graves)
+        )
+        fig_weather.update_layout(height=450, margin=dict(l=10, r=10, t=30, b=10), coloraxis_colorbar=dict(title="Mortos"))
+        st.plotly_chart(fig_weather, use_container_width=True)
 
-        with weather_center_col:
-            fig_weather = px.bar(
-                weather_summary.sort_values("acidentes"),
-                x="acidentes",
-                y="condicao_metereologica",
-                orientation="h",
-                color="acidentes",
-                color_continuous_scale=["#0F2A15", "#1DD86B", "#60FA9B"],
-            )
-            fig_weather.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10))
-            st.plotly_chart(fig_weather, width="stretch")
+    st.divider()
 
+    # 8. Heatmap de fase do dia e dia da semana
     st.subheader("Comparativo entre fase do dia e dia da semana")
     fase_dia_base = filtered.dropna(subset=["fase_dia", "dia_semana"]).copy()
     fase_dia_base["fase_dia"] = fase_dia_base["fase_dia"].astype("string").str.strip()
@@ -702,15 +1042,29 @@ def main() -> None:
     )
 
     if fase_dia_summary.empty or fase_dia_summary.to_numpy().sum() == 0:
-        st.info("Nao ha dados suficientes de fase do dia para montar o comparativo.")
+        st.info("Não há dados suficientes de fase do dia para montar o comparativo.")
     else:
+        col_totals = fase_dia_summary.sum(axis=0)
+        z_data = fase_dia_summary.to_numpy()
+        cols = list(fase_dia_summary.columns)
+        rows = list(fase_dia_summary.index)
+        text_matrix = []
+        for i, row in enumerate(rows):
+            row_text = []
+            for j, col in enumerate(cols):
+                val = z_data[i, j]
+                total = col_totals[col]
+                pct = (val / total * 100) if total else 0.0
+                row_text.append(f"{val}<br>({pct:.1f}%)")
+            text_matrix.append(row_text)
+
         fig_fase_dia = go.Figure(
             data=go.Heatmap(
-                x=list(fase_dia_summary.columns),
-                y=list(fase_dia_summary.index),
-                z=fase_dia_summary.to_numpy(),
+                x=cols,
+                y=rows,
+                z=z_data,
                 colorscale="YlOrRd",
-                text=fase_dia_summary.to_numpy(),
+                text=text_matrix,
                 texttemplate="%{text}",
                 hovertemplate="Fase do dia=%{y}<br>Dia da semana=%{x}<br>Acidentes=%{z}<extra></extra>",
                 colorbar=dict(title="Acidentes"),
@@ -722,30 +1076,19 @@ def main() -> None:
             xaxis_title="Dia da semana",
             yaxis_title="Fase do dia",
         )
-        st.plotly_chart(fig_fase_dia, width="stretch")
+        fig_fase_dia.update_yaxes(autorange="reversed")  # Reverte a ordem do Plotly para Amanhecer ficar no topo
+        st.plotly_chart(fig_fase_dia, use_container_width=True)
 
-    st.subheader("Tabela comparativa por ano")
-    table = year_summary.copy()
-    table["mortes_por_1000_acidentes"] = table["mortes_por_1000_acidentes"].round(2)
-    table["variacao_acidentes_pct"] = table["variacao_acidentes_pct"].round(2)
-    table["variacao_mortos_pct"] = table["variacao_mortos_pct"].round(2)
-    st.dataframe(table, width="stretch", hide_index=True)
+    st.divider()
 
-    csv_export = filtered.to_csv(index=False, sep=";")
-    st.download_button(
-        label="Baixar base filtrada",
-        data=csv_export,
-        file_name="datatran_filtrado.csv",
-        mime="text/csv",
-    )
-
+    # 9. Panorama mock
     st.subheader("Acidentes ocorridos em locais sinalizados")
     st.caption("Gráfico independente dos filtros, com dados até 2023.")
 
     mock_summary = build_plate_match_summary(DATA_URL, PLACAS_DATA_FILE)
 
     if mock_summary.empty:
-        st.info("Nao foi possivel montar o panorama mockado com os arquivos disponiveis.")
+        st.info("Não foi possível montar o panorama mockado com os arquivos disponíveis.")
     else:
         fig_mock = go.Figure()
         fig_mock.add_trace(
@@ -753,7 +1096,7 @@ def main() -> None:
                 x=mock_summary["Ano"],
                 y=mock_summary["Com placa"],
                 name="Com placa",
-                marker_color="#2E86DE",
+                marker_color=COLOR_ACIDENTES,
             )
         )
         fig_mock.add_trace(
@@ -761,7 +1104,7 @@ def main() -> None:
                 x=mock_summary["Ano"],
                 y=mock_summary["Sem placa"],
                 name="Sem placa",
-                marker_color="#C0392B",
+                marker_color=COLOR_MORTOS,
             )
         )
         fig_mock.update_layout(
@@ -772,7 +1115,25 @@ def main() -> None:
             yaxis_title="Quantidade de acidentes",
             legend_title_text="Resultado",
         )
-        st.plotly_chart(fig_mock, width="stretch")
+        st.plotly_chart(fig_mock, use_container_width=True)
+
+    st.divider()
+
+    # 10. Tabela comparativa e download
+    st.subheader("Tabela comparativa por ano")
+    table = year_summary.copy()
+    table["mortes_por_1000_acidentes"] = table["mortes_por_1000_acidentes"].round(2)
+    table["variacao_acidentes_pct"] = table["variacao_acidentes_pct"].round(2)
+    table["variacao_mortos_pct"] = table["variacao_mortos_pct"].round(2)
+    st.dataframe(table, use_container_width=True, hide_index=True)
+
+    csv_export = filtered.to_csv(index=False, sep=";")
+    st.download_button(
+        label="Baixar base filtrada",
+        data=csv_export,
+        file_name="datatran_filtrado.csv",
+        mime="text/csv",
+    )
 
 
 if __name__ == "__main__":
